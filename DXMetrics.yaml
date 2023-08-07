@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Lambda / Schedule to monitor the BGP Status of all Virtual Interfaces within Direct Connect
+
+Parameters:
+  CloudwatchNameSpace:
+    Type: String
+    Default: 'Custom-DX'
+
+  LambdaPowerLayerArn:
+    Type: String
+    Description: Retrieve Powertools for AWS Lambda (Python) https://docs.powertools.aws.dev/lambda/python/latest/ `
+    Default: 'arn:aws:lambda:ap-southeast-2:017000801446:layer:AWSLambdaPowertoolsPythonV2:40'
+
+  LogsRetentionInDays:
+    Description: 'Days to retain log events in the specified log group.'
+    Type: Number
+    Default: '1'
+    AllowedValues: ['1', '3', '5', '7']
+
+Resources:
+  LogGroupKmsKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: Lambda
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              Service: 'logs.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${BGPVirtualInterfaceStatus}'
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+      RetentionInDays: !Ref LogsRetentionInDays
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: DirectConnectAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - directconnect:DescribeVirtualInterfaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  BGPVirtualInterfaceStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Layers:
+        - !Ref LambdaPowerLayerArn
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          POWERTOOLS_METRICS_NAMESPACE: !Ref CloudwatchNameSpace
+      Code:
+        ZipFile: |
+          import boto3, os
+
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools import Metrics
+          from aws_lambda_powertools.metrics import MetricUnit, single_metric
+
+          logger = Logger(service=os.getenv("POWERTOOLS_METRICS_NAMESPACE", ""))
+          metrics = Metrics()
+
+          # bgpPeerState mapping
+          bgp_peer_state_lookup = {
+              'verifying': 0,  # The BGP peering addresses or ASN require validation before the BGP peer can be created. This state applies only to public virtual interfaces.
+              'pending': 2,  # The BGP peer is created, and remains in this state until it is ready to be established.
+              'available': 1,  # The BGP peer is ready to be established.
+              'deleting': 3,  # The BGP peer is being deleted.
+              'deleted': 4  # The BGP peer is deleted and cannot be established.
+          }
+
+          bgp_status_lookup = {
+              'down': 0,  # The BGP peer is down.
+              'unknown': 2,  # The BGP peer status is not available.
+              'up': 1  # The BGP peer is established. This state does not indicate the state of the routing function. Ensure that you are receiving routes over the BGP session.
+          }
+
+          @metrics.log_metrics
+          def handler(event, context):
+              client = boto3.client('directconnect')
+              response = client.describe_virtual_interfaces()
+              
+              virtual_interfaces = response.get('virtualInterfaces', [])
+              
+              results = []
+              for virtual_interface in virtual_interfaces:
+                  owner_account = virtual_interface.get('ownerAccount', None)
+                  virtual_interface_id = virtual_interface.get('virtualInterfaceId', None)
+                  location = virtual_interface.get('location', None)
+                  virtual_interface_type = virtual_interface.get('virtualInterfaceType', None)
+                  virtual_interface_name = virtual_interface.get('virtualInterfaceName', None)
+                  
+                  bgp_peers = virtual_interface.get('bgpPeers', [])
+                  if bgp_peers:
+                      bgp_peer = bgp_peers[0]
+                      bgp_peer_state = bgp_peer.get('bgpPeerState', None)
+                      bgp_status = bgp_peer.get('bgpStatus', None)
+
+                      # Convert bgp_peer_state, bgp_status_lookup to numeric value
+                      numeric_bgp_peer_state = bgp_peer_state_lookup.get(bgp_peer_state, None)
+                      numeric_bgp_status = bgp_status_lookup.get(bgp_status, None)
+                  else:
+                      bgp_peer_state = None
+                      bgp_status = None
+                      numeric_bgp_peer_state = None
+                  
+                  with single_metric(name="BGPPeerState", unit=MetricUnit.Count, value=numeric_bgp_peer_state) as metric:
+                      metric.add_dimension(name="VirtualInterfaceID", value=virtual_interface_id)
+                      metric.add_dimension(name="Location", value=location)
+                      metric.add_dimension(name="AccountOwner", value=owner_account)
+                      metric.add_dimension(name="Type", value=virtual_interface_type)
+                      metric.add_dimension(name="Name", value=virtual_interface_name)
+
+                  with single_metric(name="BGPStatus", unit=MetricUnit.Count, value=numeric_bgp_status) as metric:
+                      metric.add_dimension(name="VirtualInterfaceID", value=virtual_interface_id)
+                      metric.add_dimension(name="Location", value=location)
+                      metric.add_dimension(name="AccountOwner", value=owner_account)
+                      metric.add_dimension(name="Type", value=virtual_interface_type)
+                      metric.add_dimension(name="Name", value=virtual_interface_name)
+
+  Schedule:
+    DependsOn: LambdaLogGroup
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BGPVirtualInterfaceStatus.Arn
+          Id: "TargetFunctionV1"
+
+  PermissionToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BGPVirtualInterfaceStatus
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub ${Schedule.Arn}
+
+Outputs:
+  LambdaFunction:
+    Description: Lambda function ARN
+    Value: !GetAtt BGPVirtualInterfaceStatus.Arn
